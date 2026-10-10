@@ -52,6 +52,11 @@ Assert-True (-not $programSource.Contains("throw firstError")) "audio fallback s
 Assert-True ($programSource.Contains("RestoreDefaultRoleIds")) "audio role rollback is missing"
 Assert-True ($programSource.Contains("FindRolesNotUsingDevice")) "audio role verification is missing"
 Assert-True ($programSource.Contains("!settings.ShowBalloon && !isErrorOrWarning")) "warning and error notifications are still suppressed with routine notifications"
+Assert-True ($programSource.Contains("ScheduledTaskNamePrefix + GetCurrentUserSid()")) "startup task names are not isolated per Windows user"
+Assert-True ($programSource.Contains("IsOwnedScheduledTask")) "startup task ownership validation is missing"
+Assert-True ($programSource.Contains("VerifyStartupState")) "startup updates are not verified after mutation"
+Assert-True ($programSource.Contains("RestoreStartupState")) "startup update rollback is missing"
+Assert-True (-not $programSource.Contains('RunSchtasks("/Delete /TN " + Quote(ScheduledTaskName)')) "startup task deletion still targets an unverified fixed task name"
 
 $releaseConfig = Join-Path $root "packaging\AudioOutputSwitcher.default.ini"
 $activeConfigLines = Get-Content -LiteralPath $releaseConfig | Where-Object {
@@ -68,6 +73,24 @@ Assert-True ($activeHotkeys.Count -eq 0) "release config contains active hotkeys
     [Text.Encoding]::UTF8)
 
 $assembly = [Reflection.Assembly]::LoadFrom($output)
+$startupType = $assembly.GetType("AudioOutputSwitcher.StartupManager", $true)
+$privateStatic = [Reflection.BindingFlags]"NonPublic,Static"
+$buildTaskXmlMethod = $startupType.GetMethod("BuildScheduledTaskXml", $privateStatic)
+$getTaskNameMethod = $startupType.GetMethod("GetScheduledTaskName", $privateStatic)
+$isOwnedTaskMethod = $startupType.GetMethod("IsOwnedScheduledTask", $privateStatic)
+$taskXml = [string]$buildTaskXmlMethod.Invoke($null, @())
+$taskName = [string]$getTaskNameMethod.Invoke($null, @())
+$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+Assert-True ($taskName -eq ("AudioOutputSwitcher-" + $currentSid)) "scheduled task name is not scoped to the current SID"
+Assert-True ($taskXml.Contains("ProductId=AudioOutputSwitcher")) "scheduled task XML has no product marker"
+Assert-True ([bool]$isOwnedTaskMethod.Invoke($null, @($taskName, $taskXml))) "new scheduled task XML is not recognized as owned"
+$legacyDescription = "Starts Audio Output Switcher when the user signs in."
+$markedDescription = "Starts Audio Output Switcher when the user signs in. ProductId=AudioOutputSwitcher; OwnerSid=$currentSid."
+$legacyTaskXml = $taskXml.Replace($markedDescription, $legacyDescription)
+Assert-True ([bool]$isOwnedTaskMethod.Invoke($null, @("AudioOutputSwitcher", $legacyTaskXml))) "owned legacy startup task is not eligible for migration"
+$foreignTaskXml = $taskXml.Replace($currentSid, "S-1-5-21-1-2-3-1001")
+Assert-True (-not [bool]$isOwnedTaskMethod.Invoke($null, @($taskName, $foreignTaskXml))) "foreign-user startup task was accepted as owned"
+
 $settingsType = $assembly.GetType("AudioOutputSwitcher.AppSettings", $true)
 $loadMethod = $settingsType.GetMethod("Load", [Reflection.BindingFlags]"Public,Static")
 $saveMethod = $settingsType.GetMethod("Save", [Reflection.BindingFlags]"Public,Instance")

@@ -12,6 +12,7 @@ using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+using System.Xml;
 using Microsoft.Win32;
 using FormsTimer = System.Windows.Forms.Timer;
 
@@ -1800,7 +1801,9 @@ namespace AudioOutputSwitcher
     {
         private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string ValueName = "AudioOutputSwitcher";
-        private const string ScheduledTaskName = "AudioOutputSwitcher";
+        private const string LegacyScheduledTaskName = "AudioOutputSwitcher";
+        private const string ScheduledTaskNamePrefix = "AudioOutputSwitcher-";
+        private const string ScheduledTaskProductMarker = "ProductId=AudioOutputSwitcher";
         private const int SchtasksTimeoutMilliseconds = 10000;
 
         public static bool IsEnabled()
@@ -1868,22 +1871,52 @@ namespace AudioOutputSwitcher
 
         internal static void ApplyEnabledState(bool enabled, bool runAsAdministrator)
         {
+            bool hadRegistryEntry = HasRegistryRunEntry();
+            bool hadScheduledTask = HasScheduledTask();
+
             if (!enabled)
             {
-                RemoveScheduledTask();
-                SetRegistryRunEntry(false);
+                try
+                {
+                    RemoveScheduledTask();
+                    SetRegistryRunEntry(false);
+                    VerifyStartupState(false, false);
+                }
+                catch
+                {
+                    RestoreStartupState(hadRegistryEntry, hadScheduledTask);
+                    throw;
+                }
                 return;
             }
 
             if (runAsAdministrator)
             {
-                CreateScheduledTask();
-                SetRegistryRunEntry(false);
+                try
+                {
+                    CreateScheduledTask();
+                    SetRegistryRunEntry(false);
+                    VerifyStartupState(true, true);
+                }
+                catch
+                {
+                    RestoreStartupState(hadRegistryEntry, hadScheduledTask);
+                    throw;
+                }
                 return;
             }
 
-            RemoveScheduledTask();
-            SetRegistryRunEntry(true);
+            try
+            {
+                SetRegistryRunEntry(true);
+                RemoveScheduledTask();
+                VerifyStartupState(true, false);
+            }
+            catch
+            {
+                RestoreStartupState(hadRegistryEntry, hadScheduledTask);
+                throw;
+            }
         }
 
         private static bool HasRegistryRunEntry()
@@ -1905,7 +1938,7 @@ namespace AudioOutputSwitcher
                 string commandPath = ExtractCommandPath(value);
                 if (string.IsNullOrEmpty(commandPath))
                 {
-                    return true;
+                    return false;
                 }
 
                 return string.Equals(commandPath, target, StringComparison.OrdinalIgnoreCase);
@@ -1934,14 +1967,9 @@ namespace AudioOutputSwitcher
 
         private static bool HasScheduledTask()
         {
-            string output;
-            if (!TryGetScheduledTaskXml(out output))
-            {
-                return false;
-            }
-
-            string target = GetStartupExecutablePath();
-            return output.IndexOf(target, StringComparison.OrdinalIgnoreCase) >= 0;
+            string taskName;
+            string xml;
+            return TryGetOwnedScheduledTask(out taskName, out xml);
         }
 
         private static void CreateScheduledTask()
@@ -1952,13 +1980,23 @@ namespace AudioOutputSwitcher
                 File.WriteAllText(taskFile, BuildScheduledTaskXml(), Encoding.Unicode);
 
                 string output;
-                string command = "/Create /TN " + Quote(ScheduledTaskName)
+                string taskName = GetScheduledTaskName();
+                string command = "/Create /TN " + Quote(taskName)
                     + " /XML " + Quote(taskFile)
                     + " /F";
                 if (!RunSchtasks(command, false, out output))
                 {
                     throw new InvalidOperationException(BuildSchtasksError("Could not create the elevated startup task.", output));
                 }
+
+                string createdXml;
+                if (!TryGetScheduledTaskXml(taskName, out createdXml)
+                    || !IsOwnedScheduledTask(taskName, createdXml))
+                {
+                    throw new InvalidOperationException("Windows created the startup task, but its owner, executable, or product marker could not be verified.");
+                }
+
+                RemoveOwnedLegacyScheduledTask(taskName);
             }
             finally
             {
@@ -1972,20 +2010,23 @@ namespace AudioOutputSwitcher
             }
         }
 
-        private static bool TryGetScheduledTaskXml(out string output)
+        private static bool TryGetScheduledTaskXml(string taskName, out string output)
         {
-            return RunSchtasks("/Query /TN " + Quote(ScheduledTaskName) + " /XML", true, out output);
+            return RunSchtasks("/Query /TN " + Quote(taskName) + " /XML", true, out output);
         }
 
         private static bool ScheduledTaskNeedsRepair()
         {
+            string taskName;
             string xml;
-            if (!TryGetScheduledTaskXml(out xml))
+            if (!TryGetOwnedScheduledTask(out taskName, out xml))
             {
                 return false;
             }
 
-            return xml.IndexOf("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>", StringComparison.OrdinalIgnoreCase) < 0
+            return !string.Equals(taskName, GetScheduledTaskName(), StringComparison.OrdinalIgnoreCase)
+                || xml.IndexOf(ScheduledTaskProductMarker, StringComparison.OrdinalIgnoreCase) < 0
+                || xml.IndexOf("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>", StringComparison.OrdinalIgnoreCase) < 0
                 || xml.IndexOf("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>", StringComparison.OrdinalIgnoreCase) < 0
                 || xml.IndexOf("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>", StringComparison.OrdinalIgnoreCase) < 0
                 || xml.IndexOf("<StartWhenAvailable>true</StartWhenAvailable>", StringComparison.OrdinalIgnoreCase) < 0;
@@ -2009,7 +2050,8 @@ namespace AudioOutputSwitcher
             xml.AppendLine("<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">");
             xml.AppendLine("  <RegistrationInfo>");
             xml.AppendLine("    <Author>" + XmlEscape(author) + "</Author>");
-            xml.AppendLine("    <Description>Starts Audio Output Switcher when the user signs in.</Description>");
+            xml.AppendLine("    <Description>Starts Audio Output Switcher when the user signs in. "
+                + ScheduledTaskProductMarker + "; OwnerSid=" + XmlEscape(userId) + ".</Description>");
             xml.AppendLine("  </RegistrationInfo>");
             xml.AppendLine("  <Triggers>");
             xml.AppendLine("    <LogonTrigger>");
@@ -2061,8 +2103,213 @@ namespace AudioOutputSwitcher
 
         private static void RemoveScheduledTask()
         {
+            string[] taskNames = GetCandidateScheduledTaskNames();
+            for (int i = 0; i < taskNames.Length; i++)
+            {
+                string taskName = taskNames[i];
+                string xml;
+                if (!TryGetScheduledTaskXml(taskName, out xml))
+                {
+                    continue;
+                }
+
+                if (!IsOwnedScheduledTask(taskName, xml))
+                {
+                    CrashLogger.Write(
+                        "Skipped an unowned startup task",
+                        new InvalidOperationException("Task '" + taskName + "' did not match the current user and executable."));
+                    continue;
+                }
+
+                DeleteScheduledTask(taskName);
+                string remainingXml;
+                if (TryGetScheduledTaskXml(taskName, out remainingXml))
+                {
+                    throw new InvalidOperationException("Windows reported that startup task '" + taskName + "' was deleted, but it is still present.");
+                }
+            }
+        }
+
+        private static void VerifyStartupState(bool enabled, bool runAsAdministrator)
+        {
+            bool hasRegistryEntry = HasRegistryRunEntry();
+            bool hasScheduledTask = HasScheduledTask();
+            bool valid = enabled
+                ? (runAsAdministrator ? hasScheduledTask && !hasRegistryEntry : hasRegistryEntry && !hasScheduledTask)
+                : !hasRegistryEntry && !hasScheduledTask;
+            if (!valid)
+            {
+                throw new InvalidOperationException("Windows startup state did not match the requested mode after the update.");
+            }
+        }
+
+        private static void RestoreStartupState(bool registryEnabled, bool scheduledTaskEnabled)
+        {
+            try
+            {
+                SetRegistryRunEntry(registryEnabled);
+                if (scheduledTaskEnabled)
+                {
+                    CreateScheduledTask();
+                }
+                else
+                {
+                    RemoveScheduledTask();
+                }
+            }
+            catch (Exception ex)
+            {
+                CrashLogger.Write("Startup state rollback failed", ex);
+            }
+        }
+
+        private static string GetScheduledTaskName()
+        {
+            return ScheduledTaskNamePrefix + GetCurrentUserSid();
+        }
+
+        private static string[] GetCandidateScheduledTaskNames()
+        {
+            return new string[] { GetScheduledTaskName(), LegacyScheduledTaskName };
+        }
+
+        private static string GetCurrentUserSid()
+        {
+            using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+            {
+                if (identity.User == null)
+                {
+                    throw new InvalidOperationException("Could not determine the current Windows user SID.");
+                }
+                return identity.User.Value;
+            }
+        }
+
+        private static bool TryGetOwnedScheduledTask(out string taskName, out string xml)
+        {
+            string[] taskNames = GetCandidateScheduledTaskNames();
+            for (int i = 0; i < taskNames.Length; i++)
+            {
+                string candidate = taskNames[i];
+                string candidateXml;
+                if (TryGetScheduledTaskXml(candidate, out candidateXml)
+                    && IsOwnedScheduledTask(candidate, candidateXml))
+                {
+                    taskName = candidate;
+                    xml = candidateXml;
+                    return true;
+                }
+            }
+
+            taskName = null;
+            xml = null;
+            return false;
+        }
+
+        private static bool IsOwnedScheduledTask(string taskName, string xml)
+        {
+            try
+            {
+                XmlDocument document = new XmlDocument();
+                document.LoadXml(xml);
+                XmlNamespaceManager namespaces = new XmlNamespaceManager(document.NameTable);
+                namespaces.AddNamespace("t", "http://schemas.microsoft.com/windows/2004/02/mit/task");
+
+                string principalUser = GetNodeText(document, "//t:Principals/t:Principal/t:UserId", namespaces);
+                string triggerUser = GetNodeText(document, "//t:Triggers/t:LogonTrigger/t:UserId", namespaces);
+                string command = GetNodeText(document, "//t:Actions/t:Exec/t:Command", namespaces);
+                string description = GetNodeText(document, "//t:RegistrationInfo/t:Description", namespaces);
+                string sid = GetCurrentUserSid();
+
+                if (!string.Equals(principalUser, sid, StringComparison.OrdinalIgnoreCase)
+                    || !string.Equals(triggerUser, sid, StringComparison.OrdinalIgnoreCase)
+                    || !PathsEqual(command, GetStartupExecutablePath()))
+                {
+                    return false;
+                }
+
+                if (string.Equals(taskName, LegacyScheduledTaskName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return string.Equals(
+                        description,
+                        "Starts Audio Output Switcher when the user signs in.",
+                        StringComparison.OrdinalIgnoreCase)
+                        || description.IndexOf(ScheduledTaskProductMarker, StringComparison.OrdinalIgnoreCase) >= 0;
+                }
+
+                return description.IndexOf(ScheduledTaskProductMarker, StringComparison.OrdinalIgnoreCase) >= 0
+                    && description.IndexOf("OwnerSid=" + sid, StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            catch (Exception ex)
+            {
+                CrashLogger.Write("Could not validate a startup task", ex);
+                return false;
+            }
+        }
+
+        private static string GetNodeText(XmlDocument document, string path, XmlNamespaceManager namespaces)
+        {
+            XmlNode node = document.SelectSingleNode(path, namespaces);
+            return node == null ? string.Empty : node.InnerText.Trim();
+        }
+
+        private static bool PathsEqual(string left, string right)
+        {
+            if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+            {
+                return false;
+            }
+
+            try
+            {
+                return string.Equals(
+                    Path.GetFullPath(left.Trim().Trim('"')),
+                    Path.GetFullPath(right.Trim().Trim('"')),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void RemoveOwnedLegacyScheduledTask(string currentTaskName)
+        {
+            if (string.Equals(currentTaskName, LegacyScheduledTaskName, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            string legacyXml;
+            if (TryGetScheduledTaskXml(LegacyScheduledTaskName, out legacyXml)
+                && IsOwnedScheduledTask(LegacyScheduledTaskName, legacyXml))
+            {
+                try
+                {
+                    DeleteScheduledTask(LegacyScheduledTaskName);
+                }
+                catch
+                {
+                    try
+                    {
+                        DeleteScheduledTask(currentTaskName);
+                    }
+                    catch (Exception rollbackError)
+                    {
+                        CrashLogger.Write("Could not roll back a duplicate startup task", rollbackError);
+                    }
+                    throw;
+                }
+            }
+        }
+
+        private static void DeleteScheduledTask(string taskName)
+        {
             string output;
-            RunSchtasks("/Delete /TN " + Quote(ScheduledTaskName) + " /F", true, out output);
+            if (!RunSchtasks("/Delete /TN " + Quote(taskName) + " /F", false, out output))
+            {
+                throw new InvalidOperationException(BuildSchtasksError("Could not delete startup task '" + taskName + "'.", output));
+            }
         }
 
         private static bool RunSchtasks(string arguments, bool ignoreFailure, out string output)

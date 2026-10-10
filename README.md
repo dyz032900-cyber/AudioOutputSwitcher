@@ -180,7 +180,8 @@ Previous=Ctrl+MouseX2
    - 写入当前用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
    - 不需要管理员权限
 2. 最高权限模式
-   - 创建名为 `AudioOutputSwitcher` 的计划任务
+   - 创建按当前 Windows 用户 SID 隔离的 `AudioOutputSwitcher-<SID>` 计划任务
+   - 迁移或删除前会核对用户、目标 EXE 和产品标记，不会处理不属于当前程序的同名任务
    - 用于登录后以最高权限自动启动
 
 ### Run as administrator
