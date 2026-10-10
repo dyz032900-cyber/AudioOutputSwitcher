@@ -149,7 +149,8 @@ Previous=Ctrl+MouseX2
 ### 配置项说明
 
 - `ShowBalloon`
-  - 是否显示系统提示与切换弱提示
+  - 是否显示常规系统提示与切换弱提示
+  - 关闭后错误和重要警告仍会显示，并写入诊断日志
   - `true` / `false`
 - `RunAsAdministrator`
   - 是否优先以管理员方式运行

@@ -48,6 +48,10 @@ Assert-True ($manifest.Contains('requestedExecutionLevel level="asInvoker"')) "m
 
 $programSource = Get-Content -LiteralPath (Join-Path $root "src\Program.cs") -Raw
 Assert-True (-not $programSource.Contains("Application.DoEvents()")) "product source still contains Application.DoEvents"
+Assert-True (-not $programSource.Contains("throw firstError")) "audio fallback still discards the second provider error"
+Assert-True ($programSource.Contains("RestoreDefaultRoleIds")) "audio role rollback is missing"
+Assert-True ($programSource.Contains("FindRolesNotUsingDevice")) "audio role verification is missing"
+Assert-True ($programSource.Contains("!settings.ShowBalloon && !isErrorOrWarning")) "warning and error notifications are still suppressed with routine notifications"
 
 $releaseConfig = Join-Path $root "packaging\AudioOutputSwitcher.default.ini"
 $activeConfigLines = Get-Content -LiteralPath $releaseConfig | Where-Object {

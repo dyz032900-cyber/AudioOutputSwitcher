@@ -1110,10 +1110,17 @@ namespace AudioOutputSwitcher
 
         private void ShowBalloon(string title, string text, ToolTipIcon icon)
         {
-            if (!settings.ShowBalloon)
+            bool isErrorOrWarning = icon == ToolTipIcon.Error || icon == ToolTipIcon.Warning;
+            if (!settings.ShowBalloon && !isErrorOrWarning)
             {
                 return;
             }
+
+            if (isErrorOrWarning)
+            {
+                CrashLogger.Write(title + " notification", new InvalidOperationException(text));
+            }
+
             trayIcon.BalloonTipTitle = title;
             trayIcon.BalloonTipText = text;
             trayIcon.BalloonTipIcon = icon;
@@ -2648,6 +2655,12 @@ namespace AudioOutputSwitcher
     {
         private const int DEVICE_STATE_ACTIVE = 0x00000001;
         private const int STGM_READ = 0x00000000;
+        private static readonly ERole[] PlaybackRoles = new ERole[]
+        {
+            ERole.eConsole,
+            ERole.eMultimedia,
+            ERole.eCommunications
+        };
         private static readonly object cacheSync = new object();
         private static List<AudioDeviceInfo> cachedRenderDevices;
         private static DateTime cachedRenderDevicesUtc = DateTime.MinValue;
@@ -2722,27 +2735,100 @@ namespace AudioOutputSwitcher
 
         public static void SetDefaultRenderDevice(string deviceId)
         {
+            if (string.IsNullOrWhiteSpace(deviceId))
+            {
+                throw new ArgumentException("An audio device ID is required.", "deviceId");
+            }
+
             InvalidateRenderDevicesCache();
-            Exception firstError = null;
+            List<string> readErrors = new List<string>();
+            Dictionary<ERole, string> previousRoleIds = ReadDefaultRoleIds(readErrors);
+            if (previousRoleIds.Count != PlaybackRoles.Length)
+            {
+                throw new InvalidOperationException(
+                    "Could not read the current Windows audio role state before switching. "
+                    + JoinDiagnostics(readErrors));
+            }
+
+            List<string> diagnostics = new List<string>();
+            TrySetRolesWithPolicyConfig(deviceId, PlaybackRoles, diagnostics);
+
+            Dictionary<ERole, string> currentRoleIds = ReadDefaultRoleIds(diagnostics);
+            List<ERole> missingRoles = FindRolesNotUsingDevice(currentRoleIds, deviceId);
+            if (missingRoles.Count > 0)
+            {
+                TrySetRolesWithVistaPolicyConfig(deviceId, missingRoles, diagnostics);
+                currentRoleIds = ReadDefaultRoleIds(diagnostics);
+                missingRoles = FindRolesNotUsingDevice(currentRoleIds, deviceId);
+            }
+
+            if (missingRoles.Count == 0)
+            {
+                if (diagnostics.Count > 0)
+                {
+                    CrashLogger.Write(
+                        "Primary audio policy interface required fallback",
+                        new InvalidOperationException(JoinDiagnostics(diagnostics)));
+                }
+                InvalidateRenderDevicesCache();
+                return;
+            }
+
+            List<string> rollbackDiagnostics = new List<string>();
+            bool rollbackSucceeded = RestoreDefaultRoleIds(previousRoleIds, rollbackDiagnostics);
+            string message = "Windows did not apply the selected device to every playback role. Missing roles: "
+                + JoinRoleNames(missingRoles)
+                + ". Policy diagnostics: " + JoinDiagnostics(diagnostics)
+                + ". Rollback: " + (rollbackSucceeded ? "completed." : "incomplete: " + JoinDiagnostics(rollbackDiagnostics));
+
+            InvalidateRenderDevicesCache();
+            InvalidOperationException failure = new InvalidOperationException(message);
+            CrashLogger.Write("Audio endpoint switch failed", failure);
+            throw failure;
+        }
+
+        private static Dictionary<ERole, string> ReadDefaultRoleIds(List<string> diagnostics)
+        {
+            Dictionary<ERole, string> result = new Dictionary<ERole, string>();
+            IMMDeviceEnumerator enumerator = null;
             try
             {
-                SetDefaultWithPolicyConfig(deviceId);
-                return;
+                enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+                for (int i = 0; i < PlaybackRoles.Length; i++)
+                {
+                    ERole role = PlaybackRoles[i];
+                    IMMDevice device = null;
+                    try
+                    {
+                        int hr = enumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, role, out device);
+                        if (hr < 0 || device == null)
+                        {
+                            diagnostics.Add("Read " + GetRoleName(role) + ": " + DescribeHResult(hr));
+                            continue;
+                        }
+
+                        result[role] = GetDeviceId(device);
+                    }
+                    catch (Exception ex)
+                    {
+                        diagnostics.Add("Read " + GetRoleName(role) + ": " + ex.Message);
+                    }
+                    finally
+                    {
+                        ReleaseCom(device);
+                    }
+                }
             }
             catch (Exception ex)
             {
-                firstError = ex;
+                diagnostics.Add("Create audio endpoint enumerator: " + ex.Message);
+            }
+            finally
+            {
+                ReleaseCom(enumerator);
             }
 
-            try
-            {
-                SetDefaultWithVistaPolicyConfig(deviceId);
-                return;
-            }
-            catch
-            {
-                throw firstError;
-            }
+            return result;
         }
 
         public static void InvalidateRenderDevicesCache()
@@ -2776,7 +2862,7 @@ namespace AudioOutputSwitcher
             return result;
         }
 
-        private static void SetDefaultWithPolicyConfig(string deviceId)
+        private static void TrySetRolesWithPolicyConfig(string deviceId, IList<ERole> roles, List<string> diagnostics)
         {
             object policy = null;
             try
@@ -2784,9 +2870,19 @@ namespace AudioOutputSwitcher
                 Type type = Type.GetTypeFromCLSID(new Guid("870af99c-171d-4f9e-af0d-e63df40c2bc9"));
                 policy = Activator.CreateInstance(type);
                 IPolicyConfig config = (IPolicyConfig)policy;
-                CheckHr(config.SetDefaultEndpoint(deviceId, ERole.eConsole));
-                CheckHr(config.SetDefaultEndpoint(deviceId, ERole.eMultimedia));
-                CheckHr(config.SetDefaultEndpoint(deviceId, ERole.eCommunications));
+                for (int i = 0; i < roles.Count; i++)
+                {
+                    ERole role = roles[i];
+                    int hr = config.SetDefaultEndpoint(deviceId, role);
+                    if (hr < 0)
+                    {
+                        diagnostics.Add("PolicyConfig " + GetRoleName(role) + ": " + DescribeHResult(hr));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add("PolicyConfig unavailable: " + ex.Message);
             }
             finally
             {
@@ -2794,7 +2890,7 @@ namespace AudioOutputSwitcher
             }
         }
 
-        private static void SetDefaultWithVistaPolicyConfig(string deviceId)
+        private static void TrySetRolesWithVistaPolicyConfig(string deviceId, IList<ERole> roles, List<string> diagnostics)
         {
             object policy = null;
             try
@@ -2802,14 +2898,179 @@ namespace AudioOutputSwitcher
                 Type type = Type.GetTypeFromCLSID(new Guid("294935CE-F637-4E7C-A41B-AB255460B862"));
                 policy = Activator.CreateInstance(type);
                 IPolicyConfigVista config = (IPolicyConfigVista)policy;
-                CheckHr(config.SetDefaultEndpoint(deviceId, ERole.eConsole));
-                CheckHr(config.SetDefaultEndpoint(deviceId, ERole.eMultimedia));
-                CheckHr(config.SetDefaultEndpoint(deviceId, ERole.eCommunications));
+                for (int i = 0; i < roles.Count; i++)
+                {
+                    ERole role = roles[i];
+                    int hr = config.SetDefaultEndpoint(deviceId, role);
+                    if (hr < 0)
+                    {
+                        diagnostics.Add("VistaPolicyConfig " + GetRoleName(role) + ": " + DescribeHResult(hr));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add("VistaPolicyConfig unavailable: " + ex.Message);
             }
             finally
             {
                 ReleaseCom(policy);
             }
+        }
+
+        private static bool RestoreDefaultRoleIds(Dictionary<ERole, string> previousRoleIds, List<string> diagnostics)
+        {
+            object policy = null;
+            try
+            {
+                Type type = Type.GetTypeFromCLSID(new Guid("870af99c-171d-4f9e-af0d-e63df40c2bc9"));
+                policy = Activator.CreateInstance(type);
+                IPolicyConfig config = (IPolicyConfig)policy;
+                for (int i = 0; i < PlaybackRoles.Length; i++)
+                {
+                    ERole role = PlaybackRoles[i];
+                    string previousId;
+                    if (!previousRoleIds.TryGetValue(role, out previousId))
+                    {
+                        continue;
+                    }
+
+                    int hr = config.SetDefaultEndpoint(previousId, role);
+                    if (hr < 0)
+                    {
+                        diagnostics.Add("Rollback PolicyConfig " + GetRoleName(role) + ": " + DescribeHResult(hr));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add("Rollback PolicyConfig unavailable: " + ex.Message);
+            }
+            finally
+            {
+                ReleaseCom(policy);
+            }
+
+            Dictionary<ERole, string> currentRoleIds = ReadDefaultRoleIds(diagnostics);
+            List<ERole> missingRoles = FindRolesNotMatching(currentRoleIds, previousRoleIds);
+            if (missingRoles.Count == 0)
+            {
+                return true;
+            }
+
+            policy = null;
+            try
+            {
+                Type type = Type.GetTypeFromCLSID(new Guid("294935CE-F637-4E7C-A41B-AB255460B862"));
+                policy = Activator.CreateInstance(type);
+                IPolicyConfigVista config = (IPolicyConfigVista)policy;
+                for (int i = 0; i < missingRoles.Count; i++)
+                {
+                    ERole role = missingRoles[i];
+                    string previousId;
+                    if (!previousRoleIds.TryGetValue(role, out previousId))
+                    {
+                        continue;
+                    }
+
+                    int hr = config.SetDefaultEndpoint(previousId, role);
+                    if (hr < 0)
+                    {
+                        diagnostics.Add("Rollback VistaPolicyConfig " + GetRoleName(role) + ": " + DescribeHResult(hr));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add("Rollback VistaPolicyConfig unavailable: " + ex.Message);
+            }
+            finally
+            {
+                ReleaseCom(policy);
+            }
+
+            currentRoleIds = ReadDefaultRoleIds(diagnostics);
+            return FindRolesNotMatching(currentRoleIds, previousRoleIds).Count == 0;
+        }
+
+        private static List<ERole> FindRolesNotUsingDevice(Dictionary<ERole, string> currentRoleIds, string deviceId)
+        {
+            List<ERole> result = new List<ERole>();
+            for (int i = 0; i < PlaybackRoles.Length; i++)
+            {
+                ERole role = PlaybackRoles[i];
+                string currentId;
+                if (!currentRoleIds.TryGetValue(role, out currentId)
+                    || !string.Equals(currentId, deviceId, StringComparison.OrdinalIgnoreCase))
+                {
+                    result.Add(role);
+                }
+            }
+            return result;
+        }
+
+        private static List<ERole> FindRolesNotMatching(
+            Dictionary<ERole, string> currentRoleIds,
+            Dictionary<ERole, string> expectedRoleIds)
+        {
+            List<ERole> result = new List<ERole>();
+            for (int i = 0; i < PlaybackRoles.Length; i++)
+            {
+                ERole role = PlaybackRoles[i];
+                string currentId;
+                string expectedId;
+                if (!currentRoleIds.TryGetValue(role, out currentId)
+                    || !expectedRoleIds.TryGetValue(role, out expectedId)
+                    || !string.Equals(currentId, expectedId, StringComparison.OrdinalIgnoreCase))
+                {
+                    result.Add(role);
+                }
+            }
+            return result;
+        }
+
+        private static string JoinRoleNames(IList<ERole> roles)
+        {
+            List<string> names = new List<string>();
+            for (int i = 0; i < roles.Count; i++)
+            {
+                names.Add(GetRoleName(roles[i]));
+            }
+            return string.Join(", ", names.ToArray());
+        }
+
+        private static string GetRoleName(ERole role)
+        {
+            if (role == ERole.eConsole)
+            {
+                return "Console";
+            }
+            if (role == ERole.eMultimedia)
+            {
+                return "Multimedia";
+            }
+            return "Communications";
+        }
+
+        private static string DescribeHResult(int hr)
+        {
+            if (hr >= 0)
+            {
+                return "success";
+            }
+
+            Exception error = Marshal.GetExceptionForHR(hr);
+            string message = error == null ? "Unknown COM error" : error.Message;
+            return message + " (0x" + hr.ToString("X8") + ")";
+        }
+
+        private static string JoinDiagnostics(List<string> diagnostics)
+        {
+            if (diagnostics == null || diagnostics.Count == 0)
+            {
+                return "No additional diagnostics were reported.";
+            }
+            return string.Join(" | ", diagnostics.ToArray());
         }
 
         private static string GetDeviceId(IMMDevice device)
@@ -3004,7 +3265,7 @@ namespace AudioOutputSwitcher
             StringBuilder sb = new StringBuilder();
             sb.AppendLine("# AudioOutputSwitcher.ini");
             sb.AppendLine("# Edit in the tray app with Hotkey settings, or edit this file and choose Reload config.");
-            sb.AppendLine("# ShowBalloon controls tray notifications and switch confirmation toasts.");
+            sb.AppendLine("# ShowBalloon controls routine tray notifications and switch confirmation toasts. Errors remain visible.");
             sb.AppendLine("# RunAsAdministrator keeps manual launch in admin mode and uses a highest-privilege logon task when Start with Windows is enabled.");
             sb.AppendLine("# Keyboard examples: Ctrl+Alt+F12, Ctrl+Shift+1, Win+Alt+S.");
             sb.AppendLine("# Mouse examples: MouseX1, MouseX2, MouseMiddle, Ctrl+MouseX1, Shift+MouseRight.");
@@ -3143,7 +3404,7 @@ namespace AudioOutputSwitcher
             StringBuilder sb = new StringBuilder();
             sb.AppendLine("# AudioOutputSwitcher.ini");
             sb.AppendLine("# Edit this file, then right-click the tray icon and choose Reload config.");
-            sb.AppendLine("# ShowBalloon controls tray notifications and switch confirmation toasts.");
+            sb.AppendLine("# ShowBalloon controls routine tray notifications and switch confirmation toasts. Errors remain visible.");
             sb.AppendLine("# RunAsAdministrator keeps manual launch in admin mode and uses a highest-privilege logon task when Start with Windows is enabled.");
             sb.AppendLine("# Hotkey examples: Ctrl+Alt+F12, Ctrl+Shift+1, Win+Alt+S, MouseX1, Ctrl+MouseX1.");
             sb.AppendLine("# Actions:");
@@ -5965,7 +6226,7 @@ namespace AudioOutputSwitcher
             notificationsLayout.Controls.Add(showBalloonToggle, 1, 1);
 
             Label notificationsHint = new Label();
-            notificationsHint.Text = "Shows switch confirmations, errors, and settings updates.";
+            notificationsHint.Text = "Shows switch confirmations and settings updates. Errors remain visible.";
             notificationsHint.Dock = DockStyle.Fill;
             notificationsHint.ForeColor = UiTheme.MutedText;
             notificationsHint.Font = UiTheme.CaptionFont;
