@@ -617,6 +617,8 @@ namespace AudioOutputSwitcher
         private readonly string configPath;
         private readonly NotifyIcon trayIcon;
         private readonly ContextMenuStrip menu;
+        private readonly SynchronizationContext uiContext;
+        private readonly object deviceSnapshotSync = new object();
         private readonly GlobalHotkeyManager hotkeyManager;
         private readonly SwitchToastForm switchToast;
         private readonly FormsTimer dashboardWarmupTimer;
@@ -625,11 +627,15 @@ namespace AudioOutputSwitcher
         private DashboardForm dashboardForm;
         private AppSettings settings;
         private List<AudioDeviceInfo> devices;
+        private int menuRefreshInProgress;
+        private int menuRefreshPending;
+        private int switchInProgress;
 
         public SwitcherApplicationContext(string activationPipeName)
         {
             configPath = ConfigPathManager.ResolveConfigPath();
             settings = AppSettings.Load(configPath);
+            uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
             TryMigrateStartupMode(false);
             devices = new List<AudioDeviceInfo>();
             activationServer = new ActivationPipeServer(
@@ -638,6 +644,7 @@ namespace AudioOutputSwitcher
 
             menu = new ContextMenuStrip();
             UiTheme.ApplyMenu(menu);
+            menu.Opening += delegate { RefreshMenu(); };
             trayIcon = new NotifyIcon();
             trayIcon.Text = "Audio Output Switcher";
             trayIcon.Icon = AppIcon.Load();
@@ -667,6 +674,8 @@ namespace AudioOutputSwitcher
             };
             dashboardWarmupTimer.Start();
 
+            AddDisabledItem("Loading audio devices...");
+            AddStaticMenuItems();
             RefreshMenu();
             ApplyConfiguredHotkeys();
         }
@@ -800,7 +809,7 @@ namespace AudioOutputSwitcher
 
             dashboardForm = new DashboardForm(
                 delegate { return settings; },
-                delegate(bool forceRefresh) { return AudioManager.GetRenderDevices(forceRefresh); },
+                delegate(bool forceRefresh) { return GetDevicesForDashboard(forceRefresh); },
                 delegate(AudioDeviceInfo device) { SwitchToDevice(device); },
                 delegate { OpenHotkeySettings(); },
                 delegate { RefreshMenu(); });
@@ -808,22 +817,63 @@ namespace AudioOutputSwitcher
 
         private void RefreshMenu()
         {
-            menu.Items.Clear();
-
-            try
+            Interlocked.Exchange(ref menuRefreshPending, 1);
+            if (Interlocked.CompareExchange(ref menuRefreshInProgress, 1, 0) != 0)
             {
-                devices = AudioManager.GetRenderDevices();
-            }
-            catch (Exception ex)
-            {
-                AddDisabledItem("Could not read audio devices");
-                menu.Items.Add(new ToolStripSeparator());
-                AddMenuItem("Reload", delegate { ReloadEverything(); });
-                AddMenuItem("Exit", delegate { ExitThread(); });
-                ShowBalloon("Audio Output Switcher", ex.Message, ToolTipIcon.Error);
                 return;
             }
 
+            Interlocked.Exchange(ref menuRefreshPending, 0);
+            Thread worker = new Thread(
+                delegate()
+                {
+                    List<AudioDeviceInfo> refreshedDevices = null;
+                    Exception refreshError = null;
+                    try
+                    {
+                        refreshedDevices = AudioManager.GetRenderDevices();
+                    }
+                    catch (Exception ex)
+                    {
+                        refreshError = ex;
+                    }
+
+                    PostToUi(
+                        delegate
+                        {
+                            ApplyMenuSnapshot(refreshedDevices, refreshError);
+                            Interlocked.Exchange(ref menuRefreshInProgress, 0);
+                            if (Interlocked.Exchange(ref menuRefreshPending, 0) != 0)
+                            {
+                                RefreshMenu();
+                            }
+                        });
+                });
+            worker.IsBackground = true;
+            worker.Name = "AudioOutputSwitcher.MenuRefresh";
+            worker.SetApartmentState(ApartmentState.MTA);
+            worker.Start();
+        }
+
+        private void ApplyMenuSnapshot(List<AudioDeviceInfo> refreshedDevices, Exception refreshError)
+        {
+            menu.Items.Clear();
+            if (refreshError != null)
+            {
+                lock (deviceSnapshotSync)
+                {
+                    devices = new List<AudioDeviceInfo>();
+                }
+                AddDisabledItem("Could not read audio devices");
+                AddStaticMenuItems();
+                ShowBalloon("Audio Output Switcher", refreshError.Message, ToolTipIcon.Error);
+                return;
+            }
+
+            lock (deviceSnapshotSync)
+            {
+                devices = refreshedDevices ?? new List<AudioDeviceInfo>();
+            }
             if (devices.Count == 0)
             {
                 AddDisabledItem("No active output devices");
@@ -848,6 +898,11 @@ namespace AudioOutputSwitcher
                 }
             }
 
+            AddStaticMenuItems();
+        }
+
+        private void AddStaticMenuItems()
+        {
             menu.Items.Add(new ToolStripSeparator());
             AddMenuItem("Next output", delegate { SwitchRelative(1); });
             AddMenuItem("Previous output", delegate { SwitchRelative(-1); });
@@ -857,6 +912,33 @@ namespace AudioOutputSwitcher
             AddMenuItem("Reload config", delegate { ReloadEverything(); });
             menu.Items.Add(new ToolStripSeparator());
             AddMenuItem("Exit", delegate { ExitThread(); });
+        }
+
+        private void PostToUi(Action action)
+        {
+            if (action == null || menu == null || menu.IsDisposed)
+            {
+                Interlocked.Exchange(ref menuRefreshInProgress, 0);
+                return;
+            }
+
+            try
+            {
+                uiContext.Post(delegate(object state)
+                {
+                    if (menu == null || menu.IsDisposed)
+                    {
+                        Interlocked.Exchange(ref menuRefreshInProgress, 0);
+                        return;
+                    }
+                    action();
+                }, null);
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Exchange(ref menuRefreshInProgress, 0);
+                CrashLogger.WriteThrottledAsync("UI dispatch failed", ex, TimeSpan.FromMinutes(1));
+            }
         }
 
         private void AddDisabledItem(string text)
@@ -911,17 +993,24 @@ namespace AudioOutputSwitcher
 
         private void OpenHotkeySettings()
         {
-            try
+            List<AudioDeviceInfo> availableDevices = new List<AudioDeviceInfo>();
+            lock (deviceSnapshotSync)
             {
-                devices = AudioManager.GetRenderDevices(true);
+                for (int i = 0; i < devices.Count; i++)
+                {
+                    AudioDeviceInfo device = devices[i];
+                    availableDevices.Add(new AudioDeviceInfo
+                    {
+                        Id = device.Id,
+                        Name = device.Name,
+                        IsDefault = device.IsDefault
+                    });
+                }
             }
-            catch
-            {
-                devices = new List<AudioDeviceInfo>();
-            }
+            RefreshMenu();
 
             hotkeyManager.Clear();
-            using (HotkeySettingsForm form = new HotkeySettingsForm(settings, devices))
+            using (HotkeySettingsForm form = new HotkeySettingsForm(settings, availableDevices))
             {
                 bool previousRunAsAdministrator = settings.RunAsAdministrator;
                 form.PrepareForDisplay();
@@ -950,6 +1039,16 @@ namespace AudioOutputSwitcher
             }
 
             ApplyConfiguredHotkeys();
+        }
+
+        private List<AudioDeviceInfo> GetDevicesForDashboard(bool forceRefresh)
+        {
+            List<AudioDeviceInfo> result = AudioManager.GetRenderDevices(forceRefresh);
+            lock (deviceSnapshotSync)
+            {
+                devices = result;
+            }
+            return result;
         }
 
         private bool ApplyAdministratorPreferenceChange(bool previousRunAsAdministrator)
@@ -1002,108 +1101,146 @@ namespace AudioOutputSwitcher
             {
                 SwitchToName(action.NameContains);
             }
+            else if (action.Kind == HotkeyActionKind.DeviceId)
+            {
+                SwitchToId(action.DeviceId);
+            }
         }
 
         private void SwitchRelative(int direction)
         {
-            try
-            {
-                devices = AudioManager.GetRenderDevices();
-                if (devices.Count == 0)
+            QueueSwitch(
+                delegate(List<AudioDeviceInfo> available)
                 {
-                    ShowBalloon("Audio Output Switcher", "No active output devices.", ToolTipIcon.Warning);
-                    RefreshMenu();
-                    return;
-                }
-
-                int current = -1;
-                for (int i = 0; i < devices.Count; i++)
-                {
-                    if (devices[i].IsDefault)
+                    if (available.Count == 0)
                     {
-                        current = i;
-                        break;
+                        throw new InvalidOperationException("No active output devices.");
                     }
-                }
 
-                int next = current < 0 ? 0 : current + direction;
-                while (next < 0)
-                {
-                    next += devices.Count;
-                }
-                next = next % devices.Count;
+                    int current = -1;
+                    for (int i = 0; i < available.Count; i++)
+                    {
+                        if (available[i].IsDefault)
+                        {
+                            current = i;
+                            break;
+                        }
+                    }
 
-                SwitchToDevice(devices[next]);
-            }
-            catch (Exception ex)
-            {
-                ShowBalloon("Switch failed", ex.Message, ToolTipIcon.Error);
-            }
+                    int next = current < 0 ? 0 : current + direction;
+                    while (next < 0)
+                    {
+                        next += available.Count;
+                    }
+                    return available[next % available.Count];
+                });
         }
 
         private void SwitchToIndex(int zeroBasedIndex)
         {
-            try
-            {
-                devices = AudioManager.GetRenderDevices();
-                if (zeroBasedIndex < 0 || zeroBasedIndex >= devices.Count)
+            QueueSwitch(
+                delegate(List<AudioDeviceInfo> available)
                 {
-                    ShowBalloon("Audio Output Switcher", "Device index is not available.", ToolTipIcon.Warning);
-                    RefreshMenu();
-                    return;
-                }
-                SwitchToDevice(devices[zeroBasedIndex]);
-            }
-            catch (Exception ex)
-            {
-                ShowBalloon("Switch failed", ex.Message, ToolTipIcon.Error);
-            }
+                    if (zeroBasedIndex < 0 || zeroBasedIndex >= available.Count)
+                    {
+                        throw new InvalidOperationException("Device index is not available.");
+                    }
+                    return available[zeroBasedIndex];
+                });
         }
 
         private void SwitchToName(string namePart)
         {
-            try
-            {
-                devices = AudioManager.GetRenderDevices();
-                for (int i = 0; i < devices.Count; i++)
+            QueueSwitch(
+                delegate(List<AudioDeviceInfo> available)
                 {
-                    if (devices[i].Name.IndexOf(namePart, StringComparison.OrdinalIgnoreCase) >= 0)
+                    for (int i = 0; i < available.Count; i++)
                     {
-                        SwitchToDevice(devices[i]);
-                        return;
+                        if (available[i].Name.IndexOf(namePart, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            return available[i];
+                        }
                     }
-                }
-                ShowBalloon("Audio Output Switcher", "No device name contains: " + namePart, ToolTipIcon.Warning);
-                RefreshMenu();
-            }
-            catch (Exception ex)
-            {
-                ShowBalloon("Switch failed", ex.Message, ToolTipIcon.Error);
-            }
+                    throw new InvalidOperationException("No device name contains: " + namePart);
+                });
+        }
+
+        private void SwitchToId(string deviceId)
+        {
+            QueueSwitch(
+                delegate(List<AudioDeviceInfo> available)
+                {
+                    for (int i = 0; i < available.Count; i++)
+                    {
+                        if (string.Equals(available[i].Id, deviceId, StringComparison.OrdinalIgnoreCase))
+                        {
+                            return available[i];
+                        }
+                    }
+                    throw new InvalidOperationException("The saved audio device is not currently available.");
+                });
         }
 
         private void SwitchToDevice(AudioDeviceInfo device)
         {
-            try
+            if (device == null)
             {
-                AudioManager.SetDefaultRenderDevice(device.Id);
-                RefreshMenu();
-                if (dashboardForm != null && !dashboardForm.IsDisposed)
+                return;
+            }
+            SwitchToId(device.Id);
+        }
+
+        private void QueueSwitch(Func<List<AudioDeviceInfo>, AudioDeviceInfo> selectDevice)
+        {
+            if (selectDevice == null || Interlocked.CompareExchange(ref switchInProgress, 1, 0) != 0)
+            {
+                return;
+            }
+
+            Thread worker = new Thread(
+                delegate()
                 {
-                    dashboardForm.RefreshData();
-                }
-                ShowSwitchNotification(device.Name);
-            }
-            catch (Exception ex)
-            {
-                RefreshMenu();
-                ShowBalloon("Switch failed", ex.Message, ToolTipIcon.Error);
-            }
+                    AudioDeviceInfo selected = null;
+                    Exception switchError = null;
+                    try
+                    {
+                        List<AudioDeviceInfo> available = AudioManager.GetRenderDevices();
+                        selected = selectDevice(available);
+                        AudioManager.SetDefaultRenderDevice(selected.Id);
+                    }
+                    catch (Exception ex)
+                    {
+                        switchError = ex;
+                    }
+
+                    PostToUi(
+                        delegate
+                        {
+                            Interlocked.Exchange(ref switchInProgress, 0);
+                            RefreshMenu();
+                            if (dashboardForm != null && !dashboardForm.IsDisposed)
+                            {
+                                dashboardForm.RefreshData();
+                            }
+                            if (switchError != null)
+                            {
+                                ShowBalloon("Switch failed", switchError.Message, ToolTipIcon.Error);
+                            }
+                            else if (selected != null)
+                            {
+                                ShowSwitchNotification(selected.Name);
+                            }
+                        });
+                });
+            worker.IsBackground = true;
+            worker.Name = "AudioOutputSwitcher.DeviceSwitch";
+            worker.SetApartmentState(ApartmentState.MTA);
+            worker.Start();
         }
 
         private void ApplyConfiguredHotkeys()
         {
-            if (!hotkeyManager.SetBindings(settings.Hotkeys))
+            if (!hotkeyManager.SetBindings(settings.Hotkeys, settings.AllowInjectedInput))
             {
                 ShowBalloon("Hotkeys unavailable", hotkeyManager.LastError, ToolTipIcon.Warning);
             }
@@ -1805,10 +1942,24 @@ namespace AudioOutputSwitcher
         private const string ScheduledTaskNamePrefix = "AudioOutputSwitcher-";
         private const string ScheduledTaskProductMarker = "ProductId=AudioOutputSwitcher";
         private const int SchtasksTimeoutMilliseconds = 10000;
+        private static readonly object StartupCacheSync = new object();
+        private static bool? cachedEnabled;
+        private static DateTime cachedEnabledUtc = DateTime.MinValue;
+        private static readonly TimeSpan StartupCacheDuration = TimeSpan.FromSeconds(5);
 
         public static bool IsEnabled()
         {
-            return HasRegistryRunEntry() || HasScheduledTask();
+            lock (StartupCacheSync)
+            {
+                if (cachedEnabled.HasValue && (DateTime.UtcNow - cachedEnabledUtc) < StartupCacheDuration)
+                {
+                    return cachedEnabled.Value;
+                }
+            }
+
+            bool enabled = HasRegistryRunEntry() || HasScheduledTask();
+            SetCachedEnabled(enabled);
+            return enabled;
         }
 
         public static void SetEnabled(bool enabled, bool runAsAdministrator)
@@ -1819,6 +1970,7 @@ namespace AudioOutputSwitcher
                 string error;
                 if (ElevationManager.TryRunElevatedStartupUpdate(enabled, runAsAdministrator, out error))
                 {
+                    SetCachedEnabled(enabled);
                     return;
                 }
 
@@ -1826,6 +1978,7 @@ namespace AudioOutputSwitcher
             }
 
             ApplyEnabledState(enabled, runAsAdministrator);
+            SetCachedEnabled(enabled);
         }
 
         public static void TryMigrateEnabledMode(bool runAsAdministrator)
@@ -1881,6 +2034,7 @@ namespace AudioOutputSwitcher
                     RemoveScheduledTask();
                     SetRegistryRunEntry(false);
                     VerifyStartupState(false, false);
+                    SetCachedEnabled(false);
                 }
                 catch
                 {
@@ -1897,6 +2051,7 @@ namespace AudioOutputSwitcher
                     CreateScheduledTask();
                     SetRegistryRunEntry(false);
                     VerifyStartupState(true, true);
+                    SetCachedEnabled(true);
                 }
                 catch
                 {
@@ -1911,6 +2066,7 @@ namespace AudioOutputSwitcher
                 SetRegistryRunEntry(true);
                 RemoveScheduledTask();
                 VerifyStartupState(true, false);
+                SetCachedEnabled(true);
             }
             catch
             {
@@ -2166,6 +2322,15 @@ namespace AudioOutputSwitcher
         private static string GetScheduledTaskName()
         {
             return ScheduledTaskNamePrefix + GetCurrentUserSid();
+        }
+
+        private static void SetCachedEnabled(bool enabled)
+        {
+            lock (StartupCacheSync)
+            {
+                cachedEnabled = enabled;
+                cachedEnabledUtc = DateTime.UtcNow;
+            }
         }
 
         private static string[] GetCandidateScheduledTaskNames()
@@ -3379,6 +3544,7 @@ namespace AudioOutputSwitcher
     {
         public bool ShowBalloon = true;
         public bool RunAsAdministrator = false;
+        public bool AllowInjectedInput = false;
         public readonly List<HotkeyBinding> Hotkeys = new List<HotkeyBinding>();
         private readonly List<string> preservedSettings = new List<string>();
 
@@ -3425,6 +3591,19 @@ namespace AudioOutputSwitcher
                     if (TryParseBool(value, out parsed))
                     {
                         settings.RunAsAdministrator = parsed;
+                    }
+                    else
+                    {
+                        CrashLogger.Write("Ignored invalid boolean on configuration line " + (i + 1).ToString());
+                    }
+                    continue;
+                }
+                if (key.Equals("AllowInjectedInput", StringComparison.OrdinalIgnoreCase))
+                {
+                    bool parsed;
+                    if (TryParseBool(value, out parsed))
+                    {
+                        settings.AllowInjectedInput = parsed;
                     }
                     else
                     {
@@ -3514,12 +3693,14 @@ namespace AudioOutputSwitcher
             sb.AppendLine("# Edit in the tray app with Hotkey settings, or edit this file and choose Reload config.");
             sb.AppendLine("# ShowBalloon controls routine tray notifications and switch confirmation toasts. Errors remain visible.");
             sb.AppendLine("# RunAsAdministrator keeps manual launch in admin mode and uses a highest-privilege logon task when Start with Windows is enabled.");
+            sb.AppendLine("# AllowInjectedInput enables shortcuts generated by automation or remote-control software. It is off by default.");
             sb.AppendLine("# Keyboard examples: Ctrl+Alt+F12, Ctrl+Shift+1, Win+Alt+S.");
             sb.AppendLine("# Mouse examples: MouseX1, MouseX2, MouseMiddle, Ctrl+MouseX1, Shift+MouseRight.");
-            sb.AppendLine("# Actions: Next, Previous, Device1, Device2, Name:part-of-device-name.");
+            sb.AppendLine("# Actions: Next, Previous, Device1, Device2, Name:part-of-device-name, or an Id: entry created by the settings UI.");
             sb.AppendLine();
             sb.AppendLine("ShowBalloon=" + (ShowBalloon ? "true" : "false"));
             sb.AppendLine("RunAsAdministrator=" + (RunAsAdministrator ? "true" : "false"));
+            sb.AppendLine("AllowInjectedInput=" + (AllowInjectedInput ? "true" : "false"));
             for (int i = 0; i < Hotkeys.Count; i++)
             {
                 HotkeyBinding binding = Hotkeys[i];
@@ -3653,6 +3834,7 @@ namespace AudioOutputSwitcher
             sb.AppendLine("# Edit this file, then right-click the tray icon and choose Reload config.");
             sb.AppendLine("# ShowBalloon controls routine tray notifications and switch confirmation toasts. Errors remain visible.");
             sb.AppendLine("# RunAsAdministrator keeps manual launch in admin mode and uses a highest-privilege logon task when Start with Windows is enabled.");
+            sb.AppendLine("# AllowInjectedInput enables shortcuts generated by automation or remote-control software. It is off by default.");
             sb.AppendLine("# Hotkey examples: Ctrl+Alt+F12, Ctrl+Shift+1, Win+Alt+S, MouseX1, Ctrl+MouseX1.");
             sb.AppendLine("# Actions:");
             sb.AppendLine("#   Next=Ctrl+Alt+F12");
@@ -3663,7 +3845,8 @@ namespace AudioOutputSwitcher
             sb.AppendLine();
             sb.AppendLine("ShowBalloon=true");
             sb.AppendLine("RunAsAdministrator=false");
-            sb.AppendLine("Next=Ctrl+Alt+F12");
+            sb.AppendLine("AllowInjectedInput=false");
+            sb.AppendLine("# Next=Ctrl+Alt+F12");
             sb.AppendLine("# Previous=Ctrl+Alt+F11");
             sb.AppendLine("# Device1=Ctrl+Alt+1");
             sb.AppendLine("# Device2=Ctrl+Alt+2");
@@ -3684,7 +3867,8 @@ namespace AudioOutputSwitcher
         Next,
         Previous,
         DeviceIndex,
-        DeviceNameContains
+        DeviceNameContains,
+        DeviceId
     }
 
     internal sealed class HotkeyAction
@@ -3692,6 +3876,8 @@ namespace AudioOutputSwitcher
         public HotkeyActionKind Kind;
         public int DeviceIndex;
         public string NameContains;
+        public string DeviceId;
+        public string DeviceDisplayName;
 
         public HotkeyAction Clone()
         {
@@ -3699,7 +3885,9 @@ namespace AudioOutputSwitcher
             {
                 Kind = Kind,
                 DeviceIndex = DeviceIndex,
-                NameContains = NameContains
+                NameContains = NameContains,
+                DeviceId = DeviceId,
+                DeviceDisplayName = DeviceDisplayName
             };
         }
 
@@ -3720,6 +3908,10 @@ namespace AudioOutputSwitcher
             if (Kind == HotkeyActionKind.DeviceNameContains)
             {
                 return "Name:" + NameContains;
+            }
+            if (Kind == HotkeyActionKind.DeviceId)
+            {
+                return "Id:" + EncodeDeviceId(DeviceId);
             }
             return "Next";
         }
@@ -3742,6 +3934,10 @@ namespace AudioOutputSwitcher
             {
                 return "Switch to: " + NameContains;
             }
+            if (Kind == HotkeyActionKind.DeviceId)
+            {
+                return string.IsNullOrEmpty(DeviceDisplayName) ? "Saved audio device" : "Switch to: " + DeviceDisplayName;
+            }
             return ToSourceName();
         }
 
@@ -3758,6 +3954,10 @@ namespace AudioOutputSwitcher
             if (Kind == HotkeyActionKind.DeviceNameContains)
             {
                 return string.Equals(NameContains, other.NameContains, StringComparison.OrdinalIgnoreCase);
+            }
+            if (Kind == HotkeyActionKind.DeviceId)
+            {
+                return string.Equals(DeviceId, other.DeviceId, StringComparison.OrdinalIgnoreCase);
             }
             return true;
         }
@@ -3804,7 +4004,48 @@ namespace AudioOutputSwitcher
                     return true;
                 }
             }
+            if (value.StartsWith("Id:", StringComparison.OrdinalIgnoreCase))
+            {
+                string encodedId = value.Substring("Id:".Length).Trim();
+                string deviceId;
+                if (TryDecodeDeviceId(encodedId, out deviceId))
+                {
+                    action = new HotkeyAction { Kind = HotkeyActionKind.DeviceId, DeviceId = deviceId };
+                    return true;
+                }
+            }
             return false;
+        }
+
+        private static string EncodeDeviceId(string deviceId)
+        {
+            byte[] bytes = Encoding.UTF8.GetBytes(deviceId ?? string.Empty);
+            return Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        }
+
+        private static bool TryDecodeDeviceId(string encodedId, out string deviceId)
+        {
+            deviceId = null;
+            if (string.IsNullOrEmpty(encodedId))
+            {
+                return false;
+            }
+
+            try
+            {
+                string base64 = encodedId.Replace('-', '+').Replace('_', '/');
+                int remainder = base64.Length % 4;
+                if (remainder != 0)
+                {
+                    base64 = base64.PadRight(base64.Length + (4 - remainder), '=');
+                }
+                deviceId = Encoding.UTF8.GetString(Convert.FromBase64String(base64));
+                return !string.IsNullOrEmpty(deviceId);
+            }
+            catch (FormatException)
+            {
+                return false;
+            }
         }
     }
 
@@ -6744,8 +6985,13 @@ namespace AudioOutputSwitcher
                 result.Add(new HotkeyActionOption
                 {
                     DisplayName = "Switch to: " + name,
-                    SourceName = "Name:" + name,
-                    Action = new HotkeyAction { Kind = HotkeyActionKind.DeviceNameContains, NameContains = name }
+                    SourceName = new HotkeyAction { Kind = HotkeyActionKind.DeviceId, DeviceId = devices[i].Id }.ToSourceName(),
+                    Action = new HotkeyAction
+                    {
+                        Kind = HotkeyActionKind.DeviceId,
+                        DeviceId = devices[i].Id,
+                        DeviceDisplayName = name
+                    }
                 });
             }
 
@@ -6778,6 +7024,7 @@ namespace AudioOutputSwitcher
             }
             next.ShowBalloon = showBalloonToggle.Checked;
             next.RunAsAdministrator = runAsAdministratorToggle.Checked;
+            next.AllowInjectedInput = originalSettings != null && originalSettings.AllowInjectedInput;
 
             HashSet<string> gestures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < rows.Count; i++)
@@ -7410,6 +7657,8 @@ namespace AudioOutputSwitcher
 
         private readonly FormsTimer watchdogTimer;
         private int lastWatchdogTick;
+        private int lastRecoveryTick;
+        private bool suspendObserved;
         private bool disposed;
 
         public event Action Suspending;
@@ -7483,7 +7732,7 @@ namespace AudioOutputSwitcher
             int currentTick = Environment.TickCount;
             uint elapsed = unchecked((uint)(currentTick - lastWatchdogTick));
             lastWatchdogTick = currentTick;
-            if (elapsed >= WatchdogGapMilliseconds)
+            if (suspendObserved && elapsed >= WatchdogGapMilliseconds)
             {
                 RaiseResumed();
             }
@@ -7491,6 +7740,7 @@ namespace AudioOutputSwitcher
 
         private void RaiseSuspending()
         {
+            suspendObserved = true;
             lastWatchdogTick = Environment.TickCount;
             Action handler = Suspending;
             if (handler != null)
@@ -7501,7 +7751,16 @@ namespace AudioOutputSwitcher
 
         private void RaiseResumed()
         {
-            lastWatchdogTick = Environment.TickCount;
+            int currentTick = Environment.TickCount;
+            uint sinceLastRecovery = unchecked((uint)(currentTick - lastRecoveryTick));
+            bool resumedFromKnownSuspend = suspendObserved;
+            suspendObserved = false;
+            lastWatchdogTick = currentTick;
+            if (!resumedFromKnownSuspend && lastRecoveryTick != 0 && sinceLastRecovery < 1500)
+            {
+                return;
+            }
+            lastRecoveryTick = currentTick;
             Action handler = Resumed;
             if (handler != null)
             {
@@ -7521,6 +7780,7 @@ namespace AudioOutputSwitcher
         private readonly NativeMethods.LowLevelProc mouseProc;
         private IntPtr keyboardHook;
         private IntPtr mouseHook;
+        private bool allowInjectedInput;
 
         public event Action<HotkeyAction> HotkeyPressed;
         public string LastError = string.Empty;
@@ -7533,9 +7793,10 @@ namespace AudioOutputSwitcher
             mouseProc = MouseHookCallback;
         }
 
-        public bool SetBindings(List<HotkeyBinding> newBindings)
+        public bool SetBindings(List<HotkeyBinding> newBindings, bool allowInjected)
         {
             ClearState();
+            allowInjectedInput = allowInjected;
             bindings.Clear();
             for (int i = 0; i < newBindings.Count; i++)
             {
@@ -7649,6 +7910,10 @@ namespace AudioOutputSwitcher
                 if (nCode >= 0)
                 {
                     NativeMethods.KBDLLHOOKSTRUCT data = (NativeMethods.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(NativeMethods.KBDLLHOOKSTRUCT));
+                    if (!allowInjectedInput && (data.flags & NativeMethods.LLKHF_INJECTED) != 0)
+                    {
+                        return NativeMethods.CallNextHookEx(keyboardHook, nCode, wParam, lParam);
+                    }
                     Keys key = HotkeyDefinition.NormalizeKey((Keys)data.vkCode);
                     int message = wParam.ToInt32();
                     if (message == NativeMethods.WM_KEYDOWN || message == NativeMethods.WM_SYSKEYDOWN)
@@ -7684,6 +7949,11 @@ namespace AudioOutputSwitcher
             {
                 if (nCode >= 0)
                 {
+                    NativeMethods.MSLLHOOKSTRUCT data = (NativeMethods.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(NativeMethods.MSLLHOOKSTRUCT));
+                    if (!allowInjectedInput && (data.flags & NativeMethods.LLMHF_INJECTED) != 0)
+                    {
+                        return NativeMethods.CallNextHookEx(mouseHook, nCode, wParam, lParam);
+                    }
                     MouseInputButton button;
                     bool isDown;
                     bool isUp;
@@ -7824,6 +8094,8 @@ namespace AudioOutputSwitcher
         public const int WM_MBUTTONUP = 0x0208;
         public const int WM_XBUTTONDOWN = 0x020B;
         public const int WM_XBUTTONUP = 0x020C;
+        public const uint LLKHF_INJECTED = 0x00000010;
+        public const uint LLMHF_INJECTED = 0x00000001;
         public const int ULW_ALPHA = 0x00000002;
         public const byte AC_SRC_OVER = 0x00;
         public const byte AC_SRC_ALPHA = 0x01;

@@ -2,6 +2,7 @@
 bin/
 obj/
 artifacts/
+!installer/
 
 AudioOutputSwitcher.exe
 AudioOutputSwitcher-compilecheck.exe

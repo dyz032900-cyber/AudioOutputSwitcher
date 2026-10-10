@@ -46,6 +46,13 @@ Assert-True ($identity.sha256 -eq $actualHash) "build identity hash does not mat
 $manifest = Get-Content -LiteralPath (Join-Path $root "app.manifest") -Raw
 Assert-True ($manifest.Contains('requestedExecutionLevel level="asInvoker"')) "manifest must use asInvoker"
 
+$installerScript = Get-Content -LiteralPath (Join-Path $root "installer\AudioOutputSwitcher.iss") -Raw
+Assert-True ($installerScript.Contains('DefaultDirName={autopf}\Audio Output Switcher')) "installer does not target a protected application directory"
+Assert-True ($installerScript.Contains('PrivilegesRequired=admin')) "installer does not establish a protected per-machine boundary"
+Assert-True ($installerScript.Contains('CloseApplications=yes')) "installer does not coordinate a running application during upgrade"
+Assert-True ($installerScript.Contains('RestartApplications=no')) "installer can unexpectedly restart the tray application during maintenance"
+Assert-True ($installerScript.Contains('--startup-sync disable highest')) "uninstaller does not remove the application's owned startup registration"
+
 $programSource = Get-Content -LiteralPath (Join-Path $root "src\Program.cs") -Raw
 Assert-True (-not $programSource.Contains("Application.DoEvents()")) "product source still contains Application.DoEvents"
 Assert-True (-not $programSource.Contains("throw firstError")) "audio fallback still discards the second provider error"
@@ -57,6 +64,12 @@ Assert-True ($programSource.Contains("IsOwnedScheduledTask")) "startup task owne
 Assert-True ($programSource.Contains("VerifyStartupState")) "startup updates are not verified after mutation"
 Assert-True ($programSource.Contains("RestoreStartupState")) "startup update rollback is missing"
 Assert-True (-not $programSource.Contains('RunSchtasks("/Delete /TN " + Quote(ScheduledTaskName)')) "startup task deletion still targets an unverified fixed task name"
+Assert-True ($programSource.Contains("suspendObserved && elapsed >= WatchdogGapMilliseconds")) "power watchdog can still mistake an ordinary UI stall for resume"
+Assert-True ($programSource.Contains("LLKHF_INJECTED") -and $programSource.Contains("LLMHF_INJECTED")) "injected keyboard or mouse input is not filtered"
+Assert-True ($programSource.Contains("HotkeyActionKind.DeviceId")) "stable device-ID hotkey actions are missing"
+Assert-True ($programSource.Contains("AudioOutputSwitcher.DeviceSwitch")) "audio switching is still executed directly on the UI thread"
+Assert-True ($programSource.Contains("AudioOutputSwitcher.MenuRefresh")) "tray-device refresh is still executed directly on the UI thread"
+Assert-True (-not $programSource.Contains('sb.AppendLine("Next=Ctrl+Alt+F12");')) "first-run configuration still installs an active personal hotkey"
 
 $releaseConfig = Join-Path $root "packaging\AudioOutputSwitcher.default.ini"
 $activeConfigLines = Get-Content -LiteralPath $releaseConfig | Where-Object {
@@ -64,8 +77,9 @@ $activeConfigLines = Get-Content -LiteralPath $releaseConfig | Where-Object {
     $line -and -not $line.StartsWith('#') -and -not $line.StartsWith(';')
 }
 Assert-True (-not ($activeConfigLines -contains 'RunAsAdministrator=true')) "release config enables administrator mode"
-$activeHotkeys = @($activeConfigLines | Where-Object { $_ -match '^(Next|Previous|Device\d+|Name:.+)=' })
+$activeHotkeys = @($activeConfigLines | Where-Object { $_ -match '^(Next|Previous|Device\d+|Name:.+|Id:.+)=' })
 Assert-True ($activeHotkeys.Count -eq 0) "release config contains active hotkeys"
+Assert-True ($activeConfigLines -contains 'AllowInjectedInput=false') "release config must reject injected input by default"
 
 [IO.File]::WriteAllText(
     $configPath,
@@ -104,6 +118,17 @@ $savedConfig = [IO.File]::ReadAllText($configPath)
 $backupConfig = [IO.File]::ReadAllText($configPath + ".bak")
 Assert-True ($savedConfig.Contains("FutureSetting=keep-me")) "unknown configuration setting was lost"
 Assert-True ($backupConfig.Contains("ShowBalloon=false")) "configuration backup does not contain the prior value"
+
+$hotkeyActionType = $assembly.GetType("AudioOutputSwitcher.HotkeyAction", $true)
+$tryParseAction = $hotkeyActionType.GetMethod("TryParse", [Reflection.BindingFlags]"Public,Static")
+$deviceId = "{0.0.0.00000000}.{11111111-2222-3333-4444-555555555555}"
+$deviceAction = [Activator]::CreateInstance($hotkeyActionType)
+$deviceAction.Kind = [Enum]::Parse($assembly.GetType("AudioOutputSwitcher.HotkeyActionKind", $true), "DeviceId")
+$deviceAction.DeviceId = $deviceId
+$sourceName = [string]$hotkeyActionType.GetMethod("ToSourceName").Invoke($deviceAction, @())
+[object[]]$parseArguments = @($sourceName, $null)
+Assert-True ([bool]$tryParseAction.Invoke($null, $parseArguments)) "stable device-ID action could not be parsed"
+Assert-True ($parseArguments[1].DeviceId -eq $deviceId) "stable device-ID action did not round-trip"
 
 $lockedConfig = [IO.File]::Open($configPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
 try {

@@ -32,7 +32,7 @@ Windows 原生切换音频输出的路径比较长，通常需要：
   - 鼠标左/右/中键
   - 鼠标侧键 `MouseX1` / `MouseX2`
   - 键盘 + 鼠标组合键
-- 支持按顺序切换设备，也支持按设备序号或名称片段直达
+- 支持按顺序切换设备；设置界面创建的设备直达快捷键使用稳定设备 ID，旧版设备序号与名称片段配置继续兼容
 - 支持图形化热键录制、保存、清除、删除
 - 支持切换成功/失败、设置保存、重载配置等系统提示
 - 支持标准自启动和最高权限自启动两种模式
@@ -89,6 +89,8 @@ Windows 原生切换音频输出的路径比较长，通常需要：
 - AutoHotkey
 - 其他自动化启动器
 
+命令行方式不依赖全局 Hook。为避免远程控制或自动化软件意外触发切换，Hook 默认忽略软件注入的键鼠事件；确实需要让宏直接模拟按键时，可在配置中显式设置 `AllowInjectedInput=true`。
+
 ## 热键设置
 
 在托盘右键菜单中点击 `Hotkey settings...` 打开热键页面。
@@ -111,6 +113,7 @@ Shift+MouseRight
 - `Previous output`
 - `Device1` / `Device2` / `Device3` ...
 - `Name:设备名称片段`
+- 设置界面中的具体设备（保存后写为稳定的 `Id:` 项）
 
 你可以在界面中完成以下操作：
 
@@ -137,6 +140,7 @@ Shift+MouseRight
 ```ini
 ShowBalloon=true
 RunAsAdministrator=false
+AllowInjectedInput=false
 Next=Ctrl+Alt+F12
 Previous=Ctrl+Alt+F11
 Device1=Ctrl+Alt+1
@@ -155,6 +159,9 @@ Previous=Ctrl+MouseX2
 - `RunAsAdministrator`
   - 是否优先以管理员方式运行
   - `true` / `false`
+- `AllowInjectedInput`
+  - 是否允许自动化、远程控制等软件注入的键鼠事件触发全局热键
+  - 默认 `false`；命令行切换不受此项影响
 - `Next`
   - 切换到下一个输出设备
 - `Previous`
@@ -168,7 +175,30 @@ Previous=Ctrl+MouseX2
 
 - `DeviceN` 对应的是当前设备列表顺序
 - `Name:xxx` 使用名称片段匹配，适合设备名称比较稳定的场景
+- 热键设置界面创建的具体设备动作保存为编码后的 `Id:` 项；设备顺序变化不会切到错误目标，设备暂时离线时会明确提示失败
 - 同一个动作可以绑定多个输入
+
+## 构建与安装器
+
+开发构建与静态验证：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\verify.ps1
+```
+
+便携 ZIP：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\package.ps1
+```
+
+正式安装器需要 Inno Setup 6，随后运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build-installer.ps1
+```
+
+两条正式打包命令默认拒绝未提交的工作区；`-AllowDirty` 只用于明确标记为非发布的本地测试。安装器使用固定 AppId，默认安装到受保护的 Program Files 目录，并在升级时协调关闭运行中的程序；卸载时会清理由本程序拥有的自启动注册。用户配置继续保存在 `%LOCALAPPDATA%\AudioOutputSwitcher`，覆盖升级和默认卸载不会删除个人配置。安装器、签名和升级矩阵通过前，仓库产物仍应视为候选构建而非正式发布。
 
 ## 自启动与权限模式
 

@@ -39,6 +39,7 @@
     <Compile Include="obj\GeneratedAssemblyInfo.cs" />
     <None Include="app.manifest" />
     <None Include="VERSION" />
+    <None Include="installer\AudioOutputSwitcher.iss" />
   </ItemGroup>
   <Target Name="GenerateAssemblyInfo" BeforeTargets="BeforeBuild">
     <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\tools\GenerateAssemblyInfo.ps1&quot; -Root &quot;$(MSBuildProjectDirectory)&quot; -OutputPath &quot;$(MSBuildProjectDirectory)\obj\GeneratedAssemblyInfo.cs&quot; -IdentityPath &quot;$(MSBuildProjectDirectory)\obj\build-identity.json&quot;" />

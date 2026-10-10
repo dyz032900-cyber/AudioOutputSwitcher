@@ -1,6 +1,6 @@
 # Audio Output Switcher 上线清单与验收标准
 
-维护基线：2026-10-10（Asia/Shanghai）。以当前工作区代码为准；HEAD 为 `de2d854`，分支为 `codex/package`，存在未提交的源码、README、预览工具和打包配置改动，因此 HEAD 不能独立代表本次审阅的源码。
+维护基线：2026-10-11（Asia/Shanghai）。以当前工作区与独立 GitHub 发布仓库中的受控源码为准；风险修复仍在候选阶段，不能仅凭某个历史工作区 HEAD 认定已发布。
 
 本文是上线工程计划，不表示功能已实现或验收已通过。本轮仅进行代码、脚本和官方资料审阅，未运行应用、安装器或兼容性测试。后续每完成一项，记录实现提交、测试环境、证据路径和结论；未执行项目一律保持未勾选。
 
@@ -12,9 +12,9 @@
 | 自启动 | `StartupManager` 使用 HKCU Run 或按用户 SID 隔离的计划任务 | 已校验任务主体、目标路径和产品标记，并验证删除结果、失败回滚；仍需真实双用户与服务故障回归 |
 | 权限 | 默认 `RunAsAdministrator=false`；用户选择后用 `runas` 重启 | 需明确提权用途、取消行为、异账号提权和用户可写安装路径的安全边界 |
 | 音频 | Core Audio 枚举；两套 PolicyConfig COM 实现；依次设置三个音频角色 | 需测系统版本、失效设备及部分角色设置失败；不能只以一次调用成功验收 |
-| 构建 | `build.ps1` 直接调用系统 Framework `csc.exe`，输出 AnyCPU WinExe | 没有标准项目、显式目标框架、Release 配置或统一版本元数据 |
-| 打包 | `package.ps1` 复制根目录个人 INI；该 INI 被 Git 忽略；按分钟建立暂存目录 | 干净检出缺少 INI 时不能完成打包；可能分发个人设置；同分钟运行可能复用目录 |
-| 发布 | `PACKAGING.md` 约定在 `codex/package` 保存二进制；仓库已有历史包 | 未发现安装器、签名流水线、发布工作流、测试项目或许可证文件；历史包不能作为新 RC 的验证证据 |
+| 构建 | 已有 `.sln/.csproj`、Release 配置、manifest、统一 `VERSION`、提交身份与 SHA-256 sidecar | 仍需干净检出和目标系统矩阵复现 |
+| 打包 | `package.ps1` 使用仓库内中性配置并拒绝管理员默认值、活动热键和注入输入默认开启 | 仍需最终包内容检查和候选版签名 |
+| 发布 | 已有固定 AppId 的 Inno Setup 源码和构建脚本；本机尚无 Inno 编译器 | 安装器实包、升级/卸载矩阵、签名、许可证和发布主体仍未完成 |
 
 优先依赖顺序：P0 身份决策 → P1 配置与权限 → P2 标准构建 → P3 安装升级 → P4 签名与 RC → P5 GitHub Releases。P6 WinGet 和 P7 Store 可以提前准备资料，提交需满足各自前置条件。
 
@@ -56,10 +56,10 @@
 
 ## P3：Inno Setup、升级与卸载
 
-- [ ] 增加 `installer/AudioOutputSwitcher.iss`；默认建议当前用户安装到 `%LOCALAPPDATA%\Programs\AudioOutputSwitcher`，配合 `PrivilegesRequired=lowest`。这一方案须与 P1 的最高权限模式决策一致。[Inno 权限说明](https://jrsoftware.org/ishelp/topic_setup_privilegesrequired.htm)
-- [ ] 固定 AppId，正确填写版本、Publisher、图标和卸载信息；同一身份升级复用卸载记录。[Inno AppId 说明](https://jrsoftware.org/ishelp/topic_setup_appid.htm)
+- [x] 增加 `installer/AudioOutputSwitcher.iss` 与 `build-installer.ps1`；为最高权限自启动建立安全边界，候选方案改为安装到受保护的 Program Files，并由安装器申请管理员权限。[Inno 权限说明](https://jrsoftware.org/ishelp/topic_setup_privilegesrequired.htm)
+- [ ] 已固定 AppId、联动 `VERSION`、设置图标和卸载身份；Publisher 等真实产品身份仍待确认，同一身份升级实测仍未执行。[Inno AppId 说明](https://jrsoftware.org/ishelp/topic_setup_appid.htm)
 - [ ] 提供图形安装和静默安装/卸载；静默模式不弹应用窗口、不启动安装完成后的托盘进程，不擅自重启系统；定义退出码和日志。
-- [ ] 升级前检测并协调退出运行实例；文件被占用或退出超时时明确失败，禁止形成新旧文件混合安装。
+- [ ] 已启用 Restart Manager 关闭协调与 `restartreplace` 兜底；文件占用、拒绝退出、超时和失败恢复仍需用编译后的安装器实测，禁止形成新旧文件混合安装。
 - [ ] 覆盖安装保留配置、热键和启动意愿；替换后二进制路径、自启动来源和卸载项一致。迁移旧任务须校验归属。
 - [ ] 明确同版本修复、旧版本升级、跨目录升级和降级规则。建议默认阻止降级；回退需旧安装器及可恢复的配置备份。
 - [ ] 卸载清理本安装拥有的程序、快捷方式、Run 项和任务；默认保留用户配置，另设明确的删除个人配置选项。静默卸载默认保留配置。

@@ -15,6 +15,14 @@ This creates:
 - `package-YYYYMMDD-latest/AudioOutputSwitcher-stage-YYYYMMDD-HHmm/`
 - `package-YYYYMMDD-latest/AudioOutputSwitcher-package.zip`
 
+The ZIP is the portable candidate. To build the protected Program Files installer, install Inno Setup 6 and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build-installer.ps1
+```
+
+The installer is written to `artifacts\installer-output` with a SHA-256 sidecar. Do not call it a release until the install, upgrade, uninstall, signature, and lifecycle matrix has passed.
+
 ## Branch policy
 
 - Keep package outputs on the `codex/package` branch.
