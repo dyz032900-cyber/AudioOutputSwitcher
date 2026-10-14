@@ -211,7 +211,7 @@ powershell -ExecutionPolicy Bypass -File .\build-installer.ps1
    - 不需要管理员权限
 2. 最高权限模式
    - 创建按当前 Windows 用户 SID 隔离的 `AudioOutputSwitcher-<SID>` 计划任务
-   - 迁移或删除前会核对用户、目标 EXE 和产品标记，不会处理不属于当前程序的同名任务
+   - 迁移旧任务时兼容 Windows XML 中的 SID 与 `域\用户名` 两种当前用户表示；删除前仍会核对用户、目标 EXE 和产品标记，不会处理不属于当前程序的同名任务
    - 用于登录后以最高权限自动启动
 
 ### Run as administrator

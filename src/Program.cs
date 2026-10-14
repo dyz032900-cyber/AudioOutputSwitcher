@@ -75,7 +75,9 @@ namespace AudioOutputSwitcher
                     return;
                 }
 
+                CrashLogger.Write("Application instance started");
                 Application.Run(new SwitcherApplicationContext(ActivationPipeName));
+                CrashLogger.Write("Application message loop exited");
             }
         }
 
@@ -2386,8 +2388,8 @@ namespace AudioOutputSwitcher
                 string description = GetNodeText(document, "//t:RegistrationInfo/t:Description", namespaces);
                 string sid = GetCurrentUserSid();
 
-                if (!string.Equals(principalUser, sid, StringComparison.OrdinalIgnoreCase)
-                    || !string.Equals(triggerUser, sid, StringComparison.OrdinalIgnoreCase)
+                if (!MatchesCurrentUser(principalUser, sid)
+                    || !MatchesCurrentUser(triggerUser, sid)
                     || !PathsEqual(command, GetStartupExecutablePath()))
                 {
                     return false;
@@ -2409,6 +2411,20 @@ namespace AudioOutputSwitcher
             {
                 CrashLogger.Write("Could not validate a startup task", ex);
                 return false;
+            }
+        }
+
+        private static bool MatchesCurrentUser(string taskUser, string currentSid)
+        {
+            if (string.Equals(taskUser, currentSid, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+            {
+                return !string.IsNullOrWhiteSpace(identity.Name)
+                    && string.Equals(taskUser, identity.Name, StringComparison.OrdinalIgnoreCase);
             }
         }
 

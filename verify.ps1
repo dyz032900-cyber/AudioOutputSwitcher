@@ -102,6 +102,14 @@ $legacyDescription = "Starts Audio Output Switcher when the user signs in."
 $markedDescription = "Starts Audio Output Switcher when the user signs in. ProductId=AudioOutputSwitcher; OwnerSid=$currentSid."
 $legacyTaskXml = $taskXml.Replace($markedDescription, $legacyDescription)
 Assert-True ([bool]$isOwnedTaskMethod.Invoke($null, @("AudioOutputSwitcher", $legacyTaskXml))) "owned legacy startup task is not eligible for migration"
+$currentAccountName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$legacyNamedTriggerDocument = New-Object Xml.XmlDocument
+$legacyNamedTriggerDocument.LoadXml($legacyTaskXml)
+$taskNamespaces = New-Object Xml.XmlNamespaceManager($legacyNamedTriggerDocument.NameTable)
+$taskNamespaces.AddNamespace("t", "http://schemas.microsoft.com/windows/2004/02/mit/task")
+$legacyNamedTriggerDocument.SelectSingleNode("//t:Triggers/t:LogonTrigger/t:UserId", $taskNamespaces).InnerText = $currentAccountName
+$legacyNamedTriggerXml = $legacyNamedTriggerDocument.OuterXml
+Assert-True ([bool]$isOwnedTaskMethod.Invoke($null, @("AudioOutputSwitcher", $legacyNamedTriggerXml))) "legacy startup task using DOMAIN\\User trigger identity is not eligible for migration"
 $foreignTaskXml = $taskXml.Replace($currentSid, "S-1-5-21-1-2-3-1001")
 Assert-True (-not [bool]$isOwnedTaskMethod.Invoke($null, @($taskName, $foreignTaskXml))) "foreign-user startup task was accepted as owned"
 
